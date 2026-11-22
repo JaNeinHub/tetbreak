@@ -2,25 +2,36 @@
 (function () {
   'use strict';
 
-  const { SIZE, Game, previewPlacement } = TBCore;
+  const { Game, previewPlacement, MODES } = TBCore;
 
-  // ---------------------------------------------------------------- storage (high score only)
-  // In the Android app a native bridge (window.TetBreakNative) is used; in the browser, localStorage.
-  const BEST_KEY = 'tetbreak.best';
+  // ---------------------------------------------------------------- storage (high scores + chosen mode)
+  // Normal mode: in the Android app a native bridge (window.TetBreakNative) is used; in the browser,
+  // localStorage (key unchanged since the first release, so existing high scores stay).
+  // "Fortgeschritten" (advanced) and "Schwer" (hard) have their own high scores in localStorage.
+  const BEST_KEY = { normal: 'tetbreak.best', advanced: 'tetbreak.best.advanced', hard: 'tetbreak.best.hard' };
+  const MODE_NAME = { normal: 'Normal', advanced: 'Fortgeschritten', hard: 'Schwer' };
+  const MODE_LEVEL = { normal: 1, advanced: 2, hard: 3 };
+  const MODE_KEY = 'tetbreak.mode';
   const Store = {
-    getBest() {
+    getBest(mode) {
       try {
         const n = window.TetBreakNative;
-        if (n && n.getHighScore) return parseInt(n.getHighScore(), 10) || 0;
-        return parseInt(localStorage.getItem(BEST_KEY), 10) || 0;
+        if (mode === 'normal' && n && n.getHighScore) return parseInt(n.getHighScore(), 10) || 0;
+        return parseInt(localStorage.getItem(BEST_KEY[mode]), 10) || 0;
       } catch (e) { return 0; }
     },
-    setBest(v) {
+    setBest(mode, v) {
       try {
         const n = window.TetBreakNative;
-        if (n && n.setHighScore) { n.setHighScore(String(v)); return; }
-        localStorage.setItem(BEST_KEY, String(v));
+        if (mode === 'normal' && n && n.setHighScore) { n.setHighScore(String(v)); return; }
+        localStorage.setItem(BEST_KEY[mode], String(v));
       } catch (e) { /* storage unavailable: keep in memory only */ }
+    },
+    getMode() {
+      try { const m = localStorage.getItem(MODE_KEY); return MODES[m] ? m : 'normal'; } catch (e) { return 'normal'; }
+    },
+    setMode(m) {
+      try { localStorage.setItem(MODE_KEY, m); } catch (e) { /* ignore */ }
     }
   };
 
@@ -63,8 +74,10 @@
   const $ = id => document.getElementById(id);
 
   // ---------------------------------------------------------------- state
-  let game = new Game();
-  let best = Store.getBest();
+  let mode = Store.getMode();
+  let game = new Game(Math.random, { mode });
+  let N = game.size;      // board size of the current mode (8 or 10)
+  let best = Store.getBest(mode);
   let bestAtStart = best;
   let shownScore = 0;
   let drag = null;        // { slot, piece, x, y, touch, t0, ghost }
@@ -73,6 +86,7 @@
   let placeFx = null;     // { cells: Set, t0 }
   let texts = [];         // floating texts
   let dealT0 = performance.now();
+  let dealSlots = null;   // slots whose pieces slide in (null = all)
   let overT0 = 0;         // time the board starts greying out (0 = game running)
   let bumpT0 = -1e9;
   let dpr = 1;
@@ -143,11 +157,13 @@
       trayH
     });
     L.pad = Math.max(5, Math.round(board * 0.02));
-    L.cell = (board - 2 * L.pad) / SIZE;
+    L.cell = (board - 2 * L.pad) / N;
     L.gap = Math.max(1.5, L.cell * 0.06);
     L.gridX = L.boardX + L.pad;
     L.gridY = L.boardY + L.pad;
-    L.slotW = board / 3;
+    L.slotW = board / game.traySize;
+    // Tray cell size: room for 5-cell pieces. Wider/taller pieces (6 cells, 10x10 modes) and narrow
+    // 4-slot trays shrink single pieces as needed (trayCellFor).
     L.trayCell = Math.min(L.cell * 0.52, (L.slotW * 0.88) / 5, (trayH * 0.88) / 5);
   }
 
@@ -208,12 +224,16 @@
   }
 
   // ---------------------------------------------------------------- drag geometry
+  function trayCellFor(shape) {
+    return Math.min(L.trayCell, (L.slotW * 0.92) / shape.w, (L.trayH * 0.88) / shape.h);
+  }
+
   function liftFor(shape) { return L.cell * 0.9 + (shape.h * L.cell) / 2; } // piece centre above the finger
 
   function dragGeom(d, now) {
     const shape = d.piece.shape;
     const k = easeOutCubic(clamp01((now - d.t0) / GROW_DUR));
-    const s = lerp(L.trayCell, L.cell, k);
+    const s = lerp(trayCellFor(shape), L.cell, k);
     const lift = d.touch ? liftFor(shape) * k : 0;
     return { s, x: d.x - (shape.w * s) / 2, y: d.y - lift - (shape.h * s) / 2 };
   }
@@ -227,7 +247,7 @@
     const oy = Math.round((top - L.gridY) / L.cell);
     const pv = previewPlacement(game.board, shape, ox, oy);
     if (!pv) { drag.ghost = null; return; }
-    const cells = new Set(shape.cells.map(([x, y]) => (oy + y) * SIZE + ox + x));
+    const cells = new Set(shape.cells.map(([x, y]) => (oy + y) * N + ox + x));
     drag.ghost = { ox, oy, rows: pv.rows, cols: pv.cols, lineCells: new Set(pv.cells), cells };
   }
 
@@ -253,6 +273,23 @@
     ctx.fillStyle = '#ffd877';
     ctx.fillText(bestText, hx + crownW + 8, L.headerY + 1);
 
+    // --- mode name under the best score
+    ctx.textAlign = 'center';
+    ctx.font = '600 12px system-ui, -apple-system, Roboto, sans-serif';
+    ctx.fillStyle = '#9095ad';
+    ctx.fillText(MODE_NAME[mode], L.W / 2, L.headerY + 23);
+
+    // --- "Schwer": dots between board and tray = pieces placed this round (3 per round, the 4th stays)
+    if (game.refill === 'keep') {
+      const n = game.perRound, r = 3.5, step = 14, y = L.trayY - 7;
+      for (let i = 0; i < n; i++) {
+        const x = L.W / 2 + (i - (n - 1) / 2) * step;
+        ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2);
+        if (i < game.placedThisRound) { ctx.fillStyle = '#ffd877'; ctx.fill(); }
+        else { ctx.strokeStyle = 'rgba(255,255,255,0.28)'; ctx.lineWidth = 1.5; ctx.stroke(); }
+      }
+    }
+
     // --- score
     if (shownScore !== game.score) {
       const diff = game.score - shownScore;
@@ -272,8 +309,8 @@
     rr(L.boardX, L.boardY, L.boardSize, L.boardSize, L.pad * 2.4); ctx.fill();
     ctx.fillStyle = EMPTY;
     const es = L.cell - L.gap;
-    for (let gy = 0; gy < SIZE; gy++)
-      for (let gx = 0; gx < SIZE; gx++) {
+    for (let gy = 0; gy < N; gy++)
+      for (let gx = 0; gx < N; gx++) {
         rr(L.gridX + gx * L.cell + L.gap / 2, L.gridY + gy * L.cell + L.gap / 2, es, es, es * 0.2);
         ctx.fill();
       }
@@ -284,16 +321,16 @@
     if (ghost && (ghost.rows.length || ghost.cols.length)) {
       active = true;
       ctx.fillStyle = `rgba(255,255,255,${0.07 + 0.05 * Math.sin(now / 140)})`;
-      for (const r of ghost.rows) { rr(L.gridX, L.gridY + r * L.cell, L.cell * SIZE, L.cell, L.cell * 0.22); ctx.fill(); }
-      for (const c of ghost.cols) { rr(L.gridX + c * L.cell, L.gridY, L.cell, L.cell * SIZE, L.cell * 0.22); ctx.fill(); }
+      for (const r of ghost.rows) { rr(L.gridX, L.gridY + r * L.cell, L.cell * N, L.cell, L.cell * 0.22); ctx.fill(); }
+      for (const c of ghost.cols) { rr(L.gridX + c * L.cell, L.gridY, L.cell, L.cell * N, L.cell * 0.22); ctx.fill(); }
     }
 
     // --- tiles
     const placeK = placeFx ? clamp01((now - placeFx.t0) / PLACE_DUR) : 1;
     if (placeFx && placeK >= 1) placeFx = null;
     if (placeFx) active = true;
-    for (let i = 0; i < SIZE * SIZE; i++) {
-      const gx = i % SIZE, gy = (i / SIZE) | 0;
+    for (let i = 0; i < N * N; i++) {
+      const gx = i % N, gy = (i / N) | 0;
       const v = game.board[i];
       if (v) {
         let t = TILE[v];
@@ -305,7 +342,7 @@
         drawCell(gx, gy, hi, ghost.lineCells.has(i) ? 1 : 0.38, 1);
       }
     }
-    if (overT0 && now < overT0 + SIZE * OVER_ROW + 50) active = true;
+    if (overT0 && now < overT0 + N * OVER_ROW + 50) active = true;
 
     // --- clearing animation
     if (clearFx) {
@@ -315,7 +352,7 @@
         if (k >= 1) continue;
         alive = true;
         if (game.board[c.index]) continue; // cell already refilled
-        const gx = c.index % SIZE, gy = (c.index / SIZE) | 0;
+        const gx = c.index % N, gy = (c.index / N) | 0;
         if (k < 0) { drawCell(gx, gy, TILE[c.color], 1, 1); continue; }
         const scale = 1 - easeInQuad(k);
         drawCell(gx, gy, TILE[c.color], 1, scale);
@@ -330,13 +367,13 @@
     }
 
     // --- tray
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < game.traySize; i++) {
       const piece = game.tray[i];
       if (!piece || (drag && drag.slot === i) || returning.some(r => r.slot === i)) continue;
-      const shape = piece.shape, s = L.trayCell, c = slotCenter(i);
+      const shape = piece.shape, s = trayCellFor(shape), c = slotCenter(i);
       let x = c.x - (shape.w * s) / 2;
       const y = c.y - (shape.h * s) / 2;
-      const k = clamp01((now - dealT0 - i * DEAL_STAGGER) / DEAL_DUR);
+      const k = dealSlots && !dealSlots.has(i) ? 1 : clamp01((now - dealT0 - i * DEAL_STAGGER) / DEAL_DUR);
       if (k < 1) { x += (1 - easeOutCubic(k)) * L.W * 0.7; active = true; }
       drawPiece(shape, TILE[piece.color], x, y, s, game.pieceFits(i) ? 1 : 0.28);
     }
@@ -345,8 +382,9 @@
     returning = returning.filter(r => {
       const k = clamp01((now - r.t0) / RETURN_DUR), e = easeOutCubic(k);
       const shape = r.piece.shape, c = slotCenter(r.slot);
-      const s = lerp(r.s, L.trayCell, e);
-      const tx = c.x - (shape.w * L.trayCell) / 2, ty = c.y - (shape.h * L.trayCell) / 2;
+      const ts = trayCellFor(shape);
+      const s = lerp(r.s, ts, e);
+      const tx = c.x - (shape.w * ts) / 2, ty = c.y - (shape.h * ts) / 2;
       drawPiece(shape, TILE[r.piece.color], lerp(r.x, tx, e), lerp(r.y, ty, e), s, 1);
       return k < 1;
     });
@@ -423,7 +461,7 @@
       clearFx = {
         t0: now,
         cells: res.cleared.map(c => {
-          const gx = c.index % SIZE, gy = (c.index / SIZE) | 0;
+          const gx = c.index % N, gy = (c.index / N) | 0;
           const d = Math.hypot(gx + 0.5 - (res.ox + res.shape.w / 2), gy + 0.5 - (res.oy + res.shape.h / 2));
           return { index: c.index, color: c.color, delay: d * CLEAR_STAGGER };
         })
@@ -441,16 +479,27 @@
       haptic(8);
     }
 
-    if (res.dealt) dealT0 = now;
+    if (res.dealt) {
+      // "Schwer": the leftover piece slides to the first slot, then the new pieces come in behind it
+      let moved = false;
+      for (const mv of res.keptMoves || []) {
+        if (mv.from === mv.to) continue;
+        const piece = game.tray[mv.to], c = slotCenter(mv.from), ts = trayCellFor(piece.shape);
+        returning.push({ slot: mv.to, piece, x: c.x - (piece.shape.w * ts) / 2, y: c.y - (piece.shape.h * ts) / 2, s: ts, t0: now });
+        moved = true;
+      }
+      dealT0 = now + (moved ? 120 : 0);
+      dealSlots = new Set(res.dealtSlots);
+    }
 
     if (game.score > best) {
       best = game.score;
-      Store.setBest(best);
+      Store.setBest(mode, best);
     }
 
     if (res.over) {
       overT0 = now + (res.lines ? 500 : 200);
-      const delay = overT0 - now + SIZE * OVER_ROW + 450;
+      const delay = overT0 - now + N * OVER_ROW + 450;
       setTimeout(showGameOver, delay);
     }
     requestRender();
@@ -474,15 +523,46 @@
     texts = [];
     overT0 = 0;
     dealT0 = performance.now();
+    dealSlots = null;
     $('gameOver').classList.remove('show');
     $('confirm').classList.remove('show');
+    $('modeDlg').classList.remove('show');
     requestRender();
+  }
+
+  // ---------------------------------------------------------------- modes ("Normal" / "Fortgeschritten")
+  function updateModeButton() {
+    $('modeLabel').textContent = N + '\u00d7' + N;
+    document.querySelectorAll('#modeBtn .lvl').forEach((bar, i) => bar.classList.toggle('on', i < MODE_LEVEL[mode]));
+    $('modeBtn').setAttribute('aria-label', 'Spielmodus: ' + MODE_NAME[mode]);
+  }
+
+  function setMode(m) {
+    if (!MODES[m]) return;
+    if (m !== mode) {
+      mode = m;
+      Store.setMode(m);
+      game = new Game(Math.random, { mode });
+      N = game.size;
+      best = Store.getBest(mode);
+      updateModeButton();
+      layout();
+    }
+    newGame();
+  }
+
+  function openModeDialog() {
+    for (const m of Object.keys(MODES)) $('rec-' + m).textContent = m === mode ? best : Store.getBest(m);
+    document.querySelectorAll('.choice').forEach(b => b.classList.toggle('current', b.dataset.mode === mode));
+    $('modeNote').style.display = game.score > 0 && !overT0 ? '' : 'none';
+    $('gameOver').classList.remove('show');
+    $('modeDlg').classList.add('show');
   }
 
   // ---------------------------------------------------------------- input
   function slotAt(x, y) {
     if (y < L.trayY - 10 || y > L.H) return -1;
-    return Math.max(0, Math.min(2, Math.floor((x - L.boardX) / L.slotW)));
+    return Math.max(0, Math.min(game.traySize - 1, Math.floor((x - L.boardX) / L.slotW)));
   }
 
   canvas.addEventListener('pointerdown', e => {
@@ -537,6 +617,16 @@
   $('cfCancel').addEventListener('click', () => $('confirm').classList.remove('show'));
   $('cfOk').addEventListener('click', newGame);
   $('goPlay').addEventListener('click', newGame);
+  $('modeBtn').addEventListener('click', openModeDialog);
+  $('goMode').addEventListener('click', openModeDialog);
+  $('modeCancel').addEventListener('click', () => {
+    $('modeDlg').classList.remove('show');
+    if (overT0) showGameOver();   // came from the game-over card: go back to it
+  });
+  document.querySelectorAll('.choice').forEach(b => b.addEventListener('click', () => {
+    if (b.dataset.mode === mode && game.score > 0 && !overT0) { $('modeDlg').classList.remove('show'); return; }
+    setMode(b.dataset.mode);
+  }));
 
   function onResize() { layout(); showDebug(); requestRender(); }
 
@@ -567,6 +657,8 @@
     get game() { return game; },
     get best() { return best; },
     layout: () => L,
+    get mode() { return mode; },
+    setMode,
     newGame,
     relayout: onResize
   };
@@ -578,6 +670,7 @@
     try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {}); } catch (e) { /* ignore */ }
   }
 
+  updateModeButton();
   layout();
   showDebug();
   requestRender();
