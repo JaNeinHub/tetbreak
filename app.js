@@ -103,12 +103,14 @@
     };
   }
 
-  // Canvas pixels per CSS pixel. Phone screens are 2x-3.5x, but some browsers / privacy
-  // modes report a lower devicePixelRatio, which makes the canvas blurry. On touch screens
-  // render at least 3x (downscaling a sharper canvas costs nothing visible), capped at 3.
+  // Canvas pixels per CSS pixel. Use the screen's real devicePixelRatio (capped at 3).
+  // Forcing 3x on every touch screen made 2x devices (iPads, older iPhones) fill and
+  // composite 2.25x more pixels per frame than the screen can show, which made Safari lag.
+  // Some privacy modes report devicePixelRatio 1 on touch screens; those get 2x so the
+  // canvas is not blurry.
   function pixelRatio() {
     let r = window.devicePixelRatio || 1;
-    try { if (window.matchMedia('(pointer: coarse)').matches) r = Math.max(r, 3); } catch (e) { /* old browser */ }
+    try { if (r < 2 && window.matchMedia('(pointer: coarse)').matches) r = 2; } catch (e) { /* old browser */ }
     return Math.min(r, 3);
   }
 
@@ -130,8 +132,10 @@
   function layout() {
     const W = window.innerWidth, H = window.innerHeight;
     dpr = pixelRatio();
-    canvas.width = Math.round(W * dpr);
-    canvas.height = Math.round(H * dpr);
+    const cw = Math.round(W * dpr), ch = Math.round(H * dpr);
+    // Re-assigning width/height clears and reallocates the canvas even if nothing changed.
+    if (canvas.width !== cw) canvas.width = cw;
+    if (canvas.height !== ch) canvas.height = ch;
     canvas.style.width = W + 'px';
     canvas.style.height = H + 'px';
 
@@ -165,35 +169,115 @@
     // Tray cell size: room for 5-cell pieces. Wider/taller pieces (6 cells, 10x10 modes) and narrow
     // 4-slot trays shrink single pieces as needed (trayCellFor).
     L.trayCell = Math.min(L.cell * 0.52, (L.slotW * 0.88) / 5, (trayH * 0.88) / 5);
+    tileSprites.clear();
+    boardLayer = null;
   }
 
   // ---------------------------------------------------------------- drawing helpers
-  function rr(x, y, w, h, r) {
-    ctx.beginPath();
-    if (ctx.roundRect) { ctx.roundRect(x, y, w, h, r); return; }
+  function rr(x, y, w, h, r, c) {
+    c = c || ctx;
+    c.beginPath();
+    if (c.roundRect) { c.roundRect(x, y, w, h, r); return; }
     r = Math.min(r, w / 2, h / 2);
-    ctx.moveTo(x + r, y);
-    ctx.arcTo(x + w, y, x + w, y + h, r);
-    ctx.arcTo(x + w, y + h, x, y + h, r);
-    ctx.arcTo(x, y + h, x, y, r);
-    ctx.arcTo(x, y, x + w, y, r);
-    ctx.closePath();
+    c.moveTo(x + r, y);
+    c.arcTo(x + w, y, x + w, y + h, r);
+    c.arcTo(x + w, y + h, x, y + h, r);
+    c.arcTo(x, y + h, x, y, r);
+    c.arcTo(x, y, x + w, y, r);
+    c.closePath();
+  }
+
+  function makeLayer(w, h) {
+    const c = document.createElement('canvas');
+    c.width = Math.max(1, Math.ceil(w));
+    c.height = Math.max(1, Math.ceil(h));
+    return c;
+  }
+
+  // Paints one tile with its top-left corner at (x, y) on context c.
+  function paintTile(c, x, y, s, t) {
+    const r = s * 0.22;
+    c.fillStyle = t.dark;
+    rr(x, y, s, s, r, c); c.fill();
+    const g = c.createLinearGradient(0, y, 0, y + s);
+    g.addColorStop(0, t.light);
+    g.addColorStop(1, t.base);
+    c.fillStyle = g;
+    rr(x, y, s, s * 0.88, r, c); c.fill();
+    c.fillStyle = 'rgba(255,255,255,0.4)';
+    rr(x + s * 0.16, y + s * 0.13, s * 0.3, s * 0.1, s * 0.05, c); c.fill();
+  }
+
+  // Each tile colour is painted once into a small sprite at board-cell size (device pixels)
+  // and then stamped with drawImage. All tile proportions scale with s, so a scaled sprite
+  // looks the same as painting the tile directly, but costs one image draw instead of three
+  // path fills and a new gradient per tile per frame. Cleared on layout().
+  const tileSprites = new Map();
+  function tileSprite(t) {
+    let sp = tileSprites.get(t);
+    if (!sp) {
+      const px = Math.max(8, Math.ceil(L.cell * dpr));
+      sp = makeLayer(px, px);
+      paintTile(sp.getContext('2d'), 0, 0, px, t);
+      tileSprites.set(t, sp);
+    }
+    return sp;
   }
 
   function drawTile(x, y, s, t, alpha) {
     if (s <= 0.5) return;
     ctx.globalAlpha = alpha;
-    const r = s * 0.22;
-    ctx.fillStyle = t.dark;
-    rr(x, y, s, s, r); ctx.fill();
-    const g = ctx.createLinearGradient(0, y, 0, y + s);
-    g.addColorStop(0, t.light);
-    g.addColorStop(1, t.base);
-    ctx.fillStyle = g;
-    rr(x, y, s, s * 0.88, r); ctx.fill();
-    ctx.fillStyle = 'rgba(255,255,255,0.4)';
-    rr(x + s * 0.16, y + s * 0.13, s * 0.3, s * 0.1, s * 0.05); ctx.fill();
+    ctx.drawImage(tileSprite(t), x, y, s, s);
     ctx.globalAlpha = 1;
+  }
+
+  // The board well and its empty cells only change with the layout or the mode, so they are
+  // painted once into an offscreen layer and copied with one drawImage per frame.
+  let boardLayer = null;
+  function drawBoardWell() {
+    if (!boardLayer || boardLayer.n !== N) {
+      const m = 2; // margin in CSS px for antialiasing at the edges
+      const c = makeLayer((L.boardSize + 2 * m) * dpr, (L.boardSize + 2 * m) * dpr);
+      const b = c.getContext('2d');
+      b.setTransform(dpr, 0, 0, dpr, (m - L.boardX) * dpr, (m - L.boardY) * dpr);
+      b.fillStyle = WELL;
+      rr(L.boardX, L.boardY, L.boardSize, L.boardSize, L.pad * 2.4, b); b.fill();
+      b.fillStyle = EMPTY;
+      const es = L.cell - L.gap;
+      for (let gy = 0; gy < N; gy++)
+        for (let gx = 0; gx < N; gx++) {
+          rr(L.gridX + gx * L.cell + L.gap / 2, L.gridY + gy * L.cell + L.gap / 2, es, es, es * 0.2, b);
+          b.fill();
+        }
+      boardLayer = { canvas: c, n: N, m };
+    }
+    const m = boardLayer.m;
+    ctx.drawImage(boardLayer.canvas, L.boardX - m, L.boardY - m, L.boardSize + 2 * m, L.boardSize + 2 * m);
+  }
+
+  // The dragged piece is painted once, with its drop shadow, at full board-cell size into a
+  // sprite when the drag starts. Each frame only scales and moves that sprite, instead of
+  // running a 14px shadow blur on every tile fill of every frame (very slow in Safari).
+  const SHADOW_BLUR = 14, SHADOW_Y = 6;
+  function makeDragSprite(piece) {
+    const shape = piece.shape, s = L.cell, pad = SHADOW_BLUR * 2 + SHADOW_Y;
+    const c = makeLayer((shape.w * s + 2 * pad) * dpr, (shape.h * s + 2 * pad) * dpr);
+    const b = c.getContext('2d');
+    b.setTransform(dpr, 0, 0, dpr, 0, 0);
+    // Draw the piece far off-canvas and cast only its shadow into the sprite, then draw the
+    // piece itself on top. This keeps the shadow identical to the old per-frame version.
+    const off = 10000;
+    b.shadowColor = 'rgba(0,0,0,0.45)';
+    // Shadow values are in device pixels (not affected by the transform), as they were before.
+    b.shadowBlur = SHADOW_BLUR;
+    b.shadowOffsetX = off * dpr;
+    b.shadowOffsetY = SHADOW_Y;
+    const sp = tileSprite(TILE[piece.color]);
+    const gap = Math.max(1, s * 0.06);
+    for (const [cx, cy] of shape.cells) b.drawImage(sp, pad - off + cx * s + gap / 2, pad + cy * s + gap / 2, s - gap, s - gap);
+    b.shadowColor = 'transparent';
+    for (const [cx, cy] of shape.cells) b.drawImage(sp, pad + cx * s + gap / 2, pad + cy * s + gap / 2, s - gap, s - gap);
+    return { canvas: c, pad, s };
   }
 
   // Tile in a board cell, optionally scaled around the cell centre.
@@ -245,6 +329,9 @@
     const top = cy - (shape.h * L.cell) / 2;
     const ox = Math.round((left - L.gridX) / L.cell);
     const oy = Math.round((top - L.gridY) / L.cell);
+    // Pointer moves within the same snapped cell give the same preview: skip the board copy.
+    if (drag.gx === ox && drag.gy === oy) return;
+    drag.gx = ox; drag.gy = oy;
     const pv = previewPlacement(game.board, shape, ox, oy);
     if (!pv) { drag.ghost = null; return; }
     const cells = new Set(shape.cells.map(([x, y]) => (oy + y) * N + ox + x));
@@ -291,9 +378,14 @@
     }
 
     // --- score
+    // Count-up speed is based on elapsed time, so it is the same at 30, 60 and 120 fps
+    // (iOS Low Power Mode caps Safari at 30 fps). 0.16 per 60 fps frame as before.
+    const dt = Math.min(100, Math.max(0, now - lastRenderT));
+    lastRenderT = now;
     if (shownScore !== game.score) {
       const diff = game.score - shownScore;
-      shownScore += diff > 0 ? Math.max(1, Math.ceil(diff * 0.16)) : diff;
+      const f = 1 - Math.pow(0.84, dt / (1000 / 60));
+      shownScore += diff > 0 ? Math.max(1, Math.ceil(diff * f)) : diff;
       active = true;
     }
     const bk = clamp01((now - bumpT0) / BUMP_DUR);
@@ -305,15 +397,7 @@
     ctx.fillText(String(shownScore), L.W / 2, L.scoreY);
 
     // --- board well + empty cells
-    ctx.fillStyle = WELL;
-    rr(L.boardX, L.boardY, L.boardSize, L.boardSize, L.pad * 2.4); ctx.fill();
-    ctx.fillStyle = EMPTY;
-    const es = L.cell - L.gap;
-    for (let gy = 0; gy < N; gy++)
-      for (let gx = 0; gx < N; gx++) {
-        rr(L.gridX + gx * L.cell + L.gap / 2, L.gridY + gy * L.cell + L.gap / 2, es, es, es * 0.2);
-        ctx.fill();
-      }
+    drawBoardWell();
 
     // --- line highlight while hovering a placement that would clear lines
     const ghost = drag && drag.ghost;
@@ -393,12 +477,10 @@
     // --- dragged piece
     if (drag) {
       const g = dragGeom(drag, now);
-      ctx.save();
-      ctx.shadowColor = 'rgba(0,0,0,0.45)';
-      ctx.shadowBlur = 14;
-      ctx.shadowOffsetY = 6;
-      drawPiece(drag.piece.shape, TILE[drag.piece.color], g.x, g.y, g.s, 1);
-      ctx.restore();
+      if (!drag.sprite || drag.sprite.s !== L.cell) drag.sprite = makeDragSprite(drag.piece);
+      const sp = drag.sprite, k = g.s / sp.s, shape = drag.piece.shape;
+      ctx.drawImage(sp.canvas, g.x - sp.pad * k, g.y - sp.pad * k,
+        (shape.w * sp.s + 2 * sp.pad) * k, (shape.h * sp.s + 2 * sp.pad) * k);
       if (now - drag.t0 < GROW_DUR) active = true;
     }
 
@@ -434,6 +516,7 @@
   }
 
   let rafPending = false;
+  let lastRenderT = performance.now();
   function requestRender() {
     if (rafPending) return;
     rafPending = true;
